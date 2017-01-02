@@ -1,36 +1,52 @@
 # This Python file uses the following encoding: utf-8
-"""Script to pull down large volumes of instagram photos from a specified account."""
+"""Script to pull down large volumes of instagram photos from a specified account by simulating
+a browser connection rather than using the dedicated (and rate-limited) API. I've undoubtedly
+cargo-culted in a bunch of the magic numbers that seem to make requests work."""
 
+import sys
 import json
+import threading
+from StringIO import StringIO
 from collections import namedtuple
 
 import requests
+from PIL import Image
 from bs4 import BeautifulSoup
 
-Photo = namedtuple('Photo', ['ig_id', 'likes', 'posted', 'url', 'code', 'caption'])
+Photo = namedtuple('Photo',
+                   ['ig_id', 'likes', 'posted', 'url', 'code', 'caption', 'owner_id'])
+
+BatchMeta = namedtuple('BatchMeta',
+                       ['start_cursor', 'end_cursor', 'has_previous_page', 'has_next_page'])
 
 class Instagrab(object):
     """Class to pull images/image meta from Instagram."""
-    instagram = 'https://instagram.com'
+    instagram = 'https://www.instagram.com'
 
     def __init__(self):
         self._session = requests.Session()
+        self._session.cookies.set('ig_vw', '1366')
+        self._session.cookies.set('ig_pr', '1')
 
-    def list_images(self, account):
+    def _get_first_page(self, account):
         """List all of the instagram photos."""
-        page = self._session.get('%s/%s/' % (self.instagram, account))
+        first_page = self._session.get('%s/%s/' % (self.instagram, account))
 
-        soup = BeautifulSoup(page.text)
-        blob = self._extract_json_datablob(soup)
+        soup = BeautifulSoup(first_page.text)
+        blob = Instagrab._extract_json_datablob(soup)
 
-        """
-              "has_previous_page": false,
-              "start_cursor": "1418024076480334792",
-              "end_cursor": "1366752520647469950",
-              "has_next_page": true
-        """
+        return Instagrab._parse(blob['entry_data']['ProfilePage'][0]['user']['media'])
 
-        page_info = blob['entry_data']['ProfilePage'][0]['user']['media']['page_info']
+    @staticmethod
+    def _parse(media):
+        page_info = media['page_info']
+        nodes = media['nodes']
+
+        # Pull out the batch meta.
+        meta = BatchMeta(start_cursor=int(page_info['start_cursor']),
+                         end_cursor=int(page_info['end_cursor']),
+                         has_previous_page=page_info['has_previous_page'],
+                         has_next_page=page_info['has_next_page'])
 
         # Pull out all the relevent information for all of the images. Exclude videos.
         photos = [Photo(ig_id=x['id'],
@@ -38,13 +54,17 @@ class Instagrab(object):
                         posted=x['date'],
                         url=x['display_src'],
                         code=x['code'],
-                        caption=x['caption'])
-                  for x in blob['entry_data']['ProfilePage'][0]['user']['media']['nodes']
+                        caption=x.get('caption', None),
+                        owner_id=int(x['owner']['id']))
+                  for x in nodes
                   if x['is_video'] is False]
 
-        return photos
+        return (meta, photos)
 
-    def _extract_json_datablob(self, soup):
+    @staticmethod
+    def _extract_json_datablob(soup):
+        """The first useful json blob is being fished out of the Profile Page's HTML;
+        this method does that."""
         prefix = 'window._sharedData ='
         candidates = [x.text for x in soup.find_all('script')
                       if x.text.startswith(prefix)]
@@ -53,55 +73,86 @@ class Instagrab(object):
         else:
             return json.loads(candidates[0][len(prefix): -1])
 
-    def wip(self):
-        self._session.cookies.set('ig_vw', '1366')
-        self._session.cookies.set('ig_pr', '1')
+    def _get_next_page(self, owner_id, last_id, batch_size=12):
+        """Fetches another batch of json from the Instagram query API."""
+        instagram_query_string = \
+                """ig_user(%d) {
+                       media.after(%d, %d) {
+                       count,
+                       nodes {
+                           caption,
+                           code,
+                           comments {
+                               count
+                           },
+                           comments_disabled,
+                           date,
+                           dimensions {
+                               height,
+                               width
+                           },
+                           display_src,
+                           id,
+                           is_video,
+                           likes {
+                               count
+                           },
+                           owner {
+                               id
+                           },
+                           thumbnail_src,
+                           video_views
+                       },
+                       page_info
+                   }
+               }"""
+
         headers = {'x-csrftoken': self._session.cookies['csrftoken'],
-                   'referer': 'https://www.instagram.com/blobyblo/'}
-        data = {'q': """ig_user(15882249) { media.after(1359915155178026105, 12) {
-              count,
-              nodes {
-                caption,
-                code,
-                comments {
-                  count
-                },
-                comments_disabled,
-                date,
-                dimensions {
-                  height,
-                  width
-                },
-                display_src,
-                id,
-                is_video,
-                likes {
-                  count
-                },
-                owner {
-                  id
-                },
-                thumbnail_src,
-                video_views
-              },
-              page_info
-            }
-             }""",
-            'ref': 'users::show',
-            'query_id': '17846611669135658'}
-        url = 'https://www.instagram.com/query/'
-        response = self._session.post(url, data=data, headers=headers)
+                   'referer': 'https://www.instagram.com/'}
 
-        print json.dumps(response.json(), indent=2)
+        data = {'q': instagram_query_string % (owner_id, last_id, batch_size),
+                'ref': 'users::show',
+                'query_id': '17846611669135658'}
+
+        response = self._session.post(self.instagram + '/query/', data=data, headers=headers)
+
+        return Instagrab._parse(response.json()['media'])
+
+    def fetch_photos(self, account):
+        """Generator returning batches of photos. Will keep going until the source is exhausted."""
+        (batch_meta, photos) = self._get_first_page(account)
+        yield photos
+
+        owner_id = photos[0].owner_id
+        while batch_meta.has_next_page:
+            (batch_meta, photos) = self._get_next_page(owner_id, batch_meta.end_cursor)
+            yield photos
 
 
-#Instagrab.list_images('blobyblo')
-a = Instagrab()
-a.list_images('blobyblo')
-a.wip()
+class Downloader(object):
+    """Uses Instagrab to download photographs in parallel."""
 
-exit(0)
-print
-print """
-curl 'https://www.instagram.com/query/' -H 'x-csrftoken: w2JfJdWzerurUQQkjBi8uSOeK687B3YN' -H 'cookie: mid=WGmL_AAEAAGFE9xFkkhxp7dFkhG0; s_network=""; csrftoken=w2JfJdWzerurUQQkjBi8uSOeK687B3YN; ig_pr=1; ig_vw=1366' -H 'referer: https://www.instagram.com/blobyblo/' --data 'q=ig_user(15882249)+%7B+media.after(1366752520647469950%2C+12)+%7B%0A++count%2C%0A++nodes+%7B%0A++++caption%2C%0A++++code%2C%0A++++comments+%7B%0A++++++count%0A++++%7D%2C%0A++++comments_disabled%2C%0A++++date%2C%0A++++dimensions+%7B%0A++++++height%2C%0A++++++width%0A++++%7D%2C%0A++++display_src%2C%0A++++id%2C%0A++++is_video%2C%0A++++likes+%7B%0A++++++count%0A++++%7D%2C%0A++++owner+%7B%0A++++++id%0A++++%7D%2C%0A++++thumbnail_src%2C%0A++++video_views%0A++%7D%2C%0A++page_info%0A%7D%0A+%7D&ref=users%3A%3Ashow&query_id=17846611669135658'
-"""
+    @staticmethod
+    def save_image(photo, directory):
+        """Saves an image from a requests response."""
+        response = requests.get(photo.url)
+        image = Image.open(StringIO(response.content))
+        image.save('%s/%s.jpg' % (directory, photo.ig_id))
+        sys.stdout.write('.')
+        sys.stdout.flush()
+
+    @staticmethod
+    def download_photographs(photos, directory='content', max_batches=None):
+        """Download photographs from the Photos generator."""
+        batch_count = 0
+        while max_batches is None or max_batches < batch_count:
+            batch_count += 1
+            # We're consuming each batch in parallel which is not optimal but is better
+            #  nothing.
+            threads = [threading.Thread(target=Downloader.save_image, args=(photo, directory,))
+                       for photo in photos.next()]
+            for thread in threads:
+                thread.start()
+
+#Downloader.download_photographs(Instagrab().fetch_photos('asasjostromphotography'))
+Downloader.download_photographs(Instagrab().fetch_photos('daveyoder'))
