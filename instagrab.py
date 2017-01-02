@@ -12,9 +12,10 @@ from collections import namedtuple
 import requests
 from PIL import Image
 from bs4 import BeautifulSoup
+from pymongo import MongoClient
 
 Photo = namedtuple('Photo',
-                   ['ig_id', 'likes', 'posted', 'url', 'code', 'caption', 'owner_id'])
+                   ['ig_id', 'likes', 'posted', 'url', 'code', 'caption', 'owner_id', 'account_name'])
 
 BatchMeta = namedtuple('BatchMeta',
                        ['start_cursor', 'end_cursor', 'has_previous_page', 'has_next_page'])
@@ -35,10 +36,10 @@ class Instagrab(object):
         soup = BeautifulSoup(first_page.text)
         blob = Instagrab._extract_json_datablob(soup)
 
-        return Instagrab._parse(blob['entry_data']['ProfilePage'][0]['user']['media'])
+        return Instagrab._parse(blob['entry_data']['ProfilePage'][0]['user']['media'], account)
 
     @staticmethod
-    def _parse(media):
+    def _parse(media, account):
         page_info = media['page_info']
         nodes = media['nodes']
 
@@ -55,7 +56,8 @@ class Instagrab(object):
                         url=x['display_src'],
                         code=x['code'],
                         caption=x.get('caption', None),
-                        owner_id=int(x['owner']['id']))
+                        owner_id=int(x['owner']['id']),
+                        account_name=account)
                   for x in nodes
                   if x['is_video'] is False]
 
@@ -73,7 +75,7 @@ class Instagrab(object):
         else:
             return json.loads(candidates[0][len(prefix): -1])
 
-    def _get_next_page(self, owner_id, last_id, batch_size=12):
+    def _get_next_page(self, account, owner_id, last_id, batch_size=12):
         """Fetches another batch of json from the Instagram query API."""
         instagram_query_string = \
                 """ig_user(%d) {
@@ -116,7 +118,7 @@ class Instagrab(object):
 
         response = self._session.post(self.instagram + '/query/', data=data, headers=headers)
 
-        return Instagrab._parse(response.json()['media'])
+        return Instagrab._parse(response.json()['media'], account)
 
     def fetch_photos(self, account):
         """Generator returning batches of photos. Will keep going until the source is exhausted."""
@@ -125,7 +127,7 @@ class Instagrab(object):
 
         owner_id = photos[0].owner_id
         while batch_meta.has_next_page:
-            (batch_meta, photos) = self._get_next_page(owner_id, batch_meta.end_cursor)
+            (batch_meta, photos) = self._get_next_page(account, owner_id, batch_meta.end_cursor)
             yield photos
 
 
@@ -133,26 +135,34 @@ class Downloader(object):
     """Uses Instagrab to download photographs in parallel."""
 
     @staticmethod
-    def save_image(photo, directory):
+    def save_image(photo, directory, mongo_client=None):
         """Saves an image from a requests response."""
         response = requests.get(photo.url)
         image = Image.open(StringIO(response.content))
-        image.save('%s/%s.jpg' % (directory, photo.ig_id))
+        image_path = '%s/%s.jpg' % (directory, photo.ig_id)
+        image.save(image_path)
+        if mongo_client is not None:
+            # We want to stuff the file location into the mongodb entry along with all the
+            #  other gubbins
+            mongo_dict = photo._asdict()
+            mongo_dict['file_path'] = image_path
+            mongo_client.instagram.posts.insert_one(mongo_dict)
         sys.stdout.write('.')
         sys.stdout.flush()
 
     @staticmethod
-    def download_photographs(photos, directory='content', max_batches=None):
+    def download_photographs(photos, directory='content', max_batches=None, mongo_client=None):
         """Download photographs from the Photos generator."""
         batch_count = 0
         while max_batches is None or max_batches < batch_count:
             batch_count += 1
             # We're consuming each batch in parallel which is not optimal but is better
-            #  nothing.
-            threads = [threading.Thread(target=Downloader.save_image, args=(photo, directory,))
+            #  than nothing.
+            threads = [threading.Thread(target=Downloader.save_image, args=(photo, directory, mongo_client,))
                        for photo in photos.next()]
             for thread in threads:
                 thread.start()
 
 #Downloader.download_photographs(Instagrab().fetch_photos('asasjostromphotography'))
-Downloader.download_photographs(Instagrab().fetch_photos('daveyoder'))
+mongo_client = MongoClient('localhost', 27017)
+Downloader.download_photographs(Instagrab().fetch_photos('daveyoder'), mongo_client=mongo_client)
